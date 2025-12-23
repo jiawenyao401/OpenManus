@@ -49,10 +49,15 @@ class BaseAgent(BaseModel, ABC):
     @model_validator(mode="after")
     def initialize_agent(self) -> "BaseAgent":
         """Initialize agent with default settings if not provided."""
+        # 检查并初始化LLM
         if self.llm is None or not isinstance(self.llm, LLM):
+            logger.info(f"Initializing LLM for agent '{self.name}'")
             self.llm = LLM(config_name=self.name.lower())
+        # 检查并初始化内存
         if not isinstance(self.memory, Memory):
+            logger.info(f"Initializing memory for agent '{self.name}'")
             self.memory = Memory()
+        logger.debug(f"Agent '{self.name}' initialized successfully")
         return self
 
     @asynccontextmanager
@@ -69,17 +74,24 @@ class BaseAgent(BaseModel, ABC):
             ValueError: If the new_state is invalid.
         """
         if not isinstance(new_state, AgentState):
+            logger.error(f"Invalid state transition attempted: {new_state}")
             raise ValueError(f"Invalid state: {new_state}")
 
+        # 记录状态转换
         previous_state = self.state
+        logger.info(f"Agent '{self.name}' transitioning from {previous_state} to {new_state}")
         self.state = new_state
         try:
             yield
         except Exception as e:
-            self.state = AgentState.ERROR  # Transition to ERROR on failure
+            # 错误时转换到ERROR状态
+            logger.error(f"Error in state {new_state}: {str(e)}", exc_info=True)
+            self.state = AgentState.ERROR
             raise e
         finally:
-            self.state = previous_state  # Revert to previous state
+            # 恢复到之前的状态
+            logger.debug(f"Agent '{self.name}' reverting to state {previous_state}")
+            self.state = previous_state
 
     def update_memory(
         self,
@@ -107,11 +119,14 @@ class BaseAgent(BaseModel, ABC):
         }
 
         if role not in message_map:
+            logger.error(f"Unsupported message role: {role}")
             raise ValueError(f"Unsupported message role: {role}")
 
-        # Create message with appropriate parameters based on role
+        content_preview = content[:100] + "..." if len(content) > 100 else content
+        logger.debug(f"Adding {role} message to memory: {content_preview}")
         kwargs = {"base64_image": base64_image, **(kwargs if role == "tool" else {})}
         self.memory.add_message(message_map[role](content, **kwargs))
+        logger.debug(f"Memory now contains {len(self.memory.messages)} messages")
 
     async def run(self, request: Optional[str] = None) -> str:
         """Execute the agent's main loop asynchronously.
@@ -126,9 +141,12 @@ class BaseAgent(BaseModel, ABC):
             RuntimeError: If the agent is not in IDLE state at start.
         """
         if self.state != AgentState.IDLE:
+            logger.error(f"Cannot run agent from state: {self.state}")
             raise RuntimeError(f"Cannot run agent from state: {self.state}")
 
+        logger.info(f"Starting agent '{self.name}' execution")
         if request:
+            logger.debug(f"Initial request: {request}")
             self.update_memory("user", request)
 
         results: List[str] = []
@@ -140,16 +158,19 @@ class BaseAgent(BaseModel, ABC):
                 logger.info(f"Executing step {self.current_step}/{self.max_steps}")
                 step_result = await self.step()
 
-                # Check for stuck state
                 if self.is_stuck():
+                    logger.warning(f"Agent '{self.name}' detected stuck state at step {self.current_step}")
                     self.handle_stuck_state()
 
                 results.append(f"Step {self.current_step}: {step_result}")
 
             if self.current_step >= self.max_steps:
+                logger.warning(f"Agent '{self.name}' reached max steps ({self.max_steps})")
                 self.current_step = 0
                 self.state = AgentState.IDLE
                 results.append(f"Terminated: Reached max steps ({self.max_steps})")
+        
+        logger.info(f"Agent '{self.name}' execution completed")
         await SANDBOX_CLIENT.cleanup()
         return "\n".join(results) if results else "No steps executed"
 
@@ -162,10 +183,9 @@ class BaseAgent(BaseModel, ABC):
 
     def handle_stuck_state(self):
         """Handle stuck state by adding a prompt to change strategy"""
-        stuck_prompt = "\
-        Observed duplicate responses. Consider new strategies and avoid repeating ineffective paths already attempted."
+        stuck_prompt = "Observed duplicate responses. Consider new strategies and avoid repeating ineffective paths already attempted."
         self.next_step_prompt = f"{stuck_prompt}\n{self.next_step_prompt}"
-        logger.warning(f"Agent detected stuck state. Added prompt: {stuck_prompt}")
+        logger.warning(f"Agent '{self.name}' detected stuck state. Added strategy change prompt")
 
     def is_stuck(self) -> bool:
         """Check if the agent is stuck in a loop by detecting duplicate content"""
@@ -176,13 +196,17 @@ class BaseAgent(BaseModel, ABC):
         if not last_message.content:
             return False
 
-        # Count identical content occurrences
+        # 计算重复内容的出现次数
         duplicate_count = sum(
             1
             for msg in reversed(self.memory.messages[:-1])
             if msg.role == "assistant" and msg.content == last_message.content
         )
 
+        # 记录检测结果
+        if duplicate_count >= self.duplicate_threshold:
+            logger.debug(f"Agent '{self.name}' detected {duplicate_count} duplicate responses (threshold: {self.duplicate_threshold})")
+        
         return duplicate_count >= self.duplicate_threshold
 
     @property
